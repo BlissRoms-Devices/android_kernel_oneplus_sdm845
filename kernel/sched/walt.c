@@ -29,7 +29,6 @@
 #include "walt.h"
 
 #include <trace/events/sched.h>
-#include "../drivers/oneplus/coretech/uxcore/opchain_helper.h"
 
 const char *task_event_names[] = {"PUT_PREV_TASK", "PICK_NEXT_TASK",
 				  "TASK_WAKE", "TASK_MIGRATE", "TASK_UPDATE",
@@ -1726,8 +1725,7 @@ static void update_history(struct rq *rq, struct task_struct *p,
 
 	if (sched_window_stats_policy == WINDOW_STATS_RECENT) {
 		demand = runtime;
-	} else if (sched_window_stats_policy == WINDOW_STATS_MAX ||
-	    ((likely(opc_boost_tl) && *opc_boost_tl) && task_cpu(p) >= 4)) {
+	irq_work_queue(&walt_cpufreq_irq_work);} else if (sched_window_stats_policy == WINDOW_STATS_MAX) {
 		demand = max;
 	} else {
 		avg = div64_u64(sum, sched_ravg_hist_size);
@@ -1960,8 +1958,6 @@ static inline void run_walt_irq_work(u64 old_window_start, struct rq *rq)
 	if (result == old_window_start)
 		irq_work_queue(&walt_cpufreq_irq_work);
 }
-
-
 
 /* Reflect task activity on its demand and cpu's busy time statistics */
 void update_task_ravg(struct task_struct *p, struct rq *rq, int event,
@@ -3250,7 +3246,6 @@ void walt_irq_work(struct irq_work *irq_work)
 	struct rq *rq;
 	int cpu;
 	u64 wc, total_grp_load = 0;
-	int flag = SCHED_CPUFREQ_WALT;
 	bool is_migration = false;
 	int level = 0;
 
@@ -3296,16 +3291,16 @@ void walt_irq_work(struct irq_work *irq_work)
 
 	for_each_sched_cluster(cluster) {
 		for_each_cpu(cpu, &cluster->cpus) {
-			int nflag = flag;
+			int nflag = 0;
 
 			rq = cpu_rq(cpu);
 
 			if (is_migration) {
 				if (rq->notif_pending) {
-					nflag |= SCHED_CPUFREQ_INTERCLUSTER_MIG;
+					nflag = SCHED_CPUFREQ_INTERCLUSTER_MIG;
 					rq->notif_pending = false;
 				} else {
-					nflag |= SCHED_CPUFREQ_FORCE_UPDATE;
+					nflag = SCHED_CPUFREQ_FORCE_UPDATE;
 				}
 			}
 

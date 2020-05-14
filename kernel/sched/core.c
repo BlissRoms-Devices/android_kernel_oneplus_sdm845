@@ -1119,6 +1119,17 @@ void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_ma
 	p->nr_cpus_allowed = cpumask_weight(new_mask);
 }
 
+static const struct cpumask *
+adjust_cpumask(const struct task_struct *p,
+		     const struct cpumask *orig_mask)
+{
+	/* Force all performance-critical kthreads onto the big cluster */
+	if (p->flags & PF_PERF_CRITICAL)
+		return cpu_perf_mask;
+
+	return orig_mask;
+}
+
 void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
 {
 	struct rq *rq = task_rq(p);
@@ -1166,6 +1177,8 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 	struct rq *rq;
 	int ret = 0;
 	cpumask_t allowed_mask;
+
+	new_mask = adjust_cpumask(p, new_mask);
 
 	rq = task_rq_lock(p, &rf);
 	update_rq_clock(rq);
@@ -2199,9 +2212,7 @@ out:
 	if (success && sched_predl) {
 		raw_spin_lock_irqsave(&cpu_rq(cpu)->lock, flags);
 		if (do_pl_notif(cpu_rq(cpu)))
-			cpufreq_update_util(cpu_rq(cpu),
-					    SCHED_CPUFREQ_WALT |
-					    SCHED_CPUFREQ_PL);
+			cpufreq_update_util(cpu_rq(cpu), SCHED_CPUFREQ_PL);
 		raw_spin_unlock_irqrestore(&cpu_rq(cpu)->lock, flags);
 	}
 
@@ -2323,7 +2334,6 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->se.nr_migrations		= 0;
 	p->se.vruntime			= 0;
 	p->last_sleep_ts		= 0;
-	p->last_cpu_selected_ts		= 0;
 
 	INIT_LIST_HEAD(&p->se.group_node);
 
@@ -3240,7 +3250,6 @@ void scheduler_tick(void)
 	bool early_notif;
 	u32 old_load;
 	struct related_thread_group *grp;
-	unsigned int flag = 0;
 
 	sched_clock_tick();
 
@@ -3259,9 +3268,8 @@ void scheduler_tick(void)
 
 	early_notif = early_detection_notify(rq, wallclock);
 	if (early_notif)
-		flag = SCHED_CPUFREQ_WALT | SCHED_CPUFREQ_EARLY_DET;
+		cpufreq_update_util(rq, SCHED_CPUFREQ_EARLY_DET);
 
-	cpufreq_update_util(rq, flag);
 
 	psi_task_tick(rq);
 

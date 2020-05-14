@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/input.h>
 #include <linux/time.h>
+#include <linux/binfmts.h>
 
 struct cpu_sync {
 	int cpu;
@@ -34,15 +35,26 @@ static struct workqueue_struct *cpu_boost_wq;
 
 static struct work_struct input_boost_work;
 
-static bool input_boost_enabled;
+static bool input_boost_enabled = true;
+module_param(input_boost_enabled, bool, 0644);
 
-static unsigned int input_boost_ms = 40;
-module_param(input_boost_ms, uint, 0644);
+static unsigned int input_boost_ms = CONFIG_INPUT_BOOST_DURATION_MS;
+module_param_named(input_boost_duration, input_boost_ms, uint, 0644);
 
 static unsigned int sched_boost_on_input;
 module_param(sched_boost_on_input, uint, 0644);
 
 static bool sched_boost_active;
+
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+static int dynamic_stune_boost = CONFIG_INPUT_STUNE_BOOST;
+module_param(dynamic_stune_boost, uint, 0644);
+static bool stune_boost_active;
+static int boost_slot;
+static unsigned int dynamic_stune_boost_ms = CONFIG_INPUT_STUNE_BOOST_DURATION;
+module_param(dynamic_stune_boost_ms, uint, 0644);
+static struct delayed_work dynamic_stune_boost_rem;
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 static struct delayed_work input_boost_rem;
 static u64 last_input_time;
@@ -53,7 +65,9 @@ static int set_input_boost_freq(const char *buf, const struct kernel_param *kp)
 	int i, ntokens = 0;
 	unsigned int val, cpu;
 	const char *cp = buf;
-	bool enabled = false;
+
+	if (task_is_booster(current))
+		goto out;
 
 	while ((cp = strpbrk(cp + 1, " :")))
 		ntokens++;
@@ -64,7 +78,7 @@ static int set_input_boost_freq(const char *buf, const struct kernel_param *kp)
 			return -EINVAL;
 		for_each_possible_cpu(i)
 			per_cpu(sync_info, i).input_boost_freq = val;
-		goto check_enable;
+		goto out;
 	}
 
 	/* CPU:value pair */
@@ -83,15 +97,7 @@ static int set_input_boost_freq(const char *buf, const struct kernel_param *kp)
 		cp++;
 	}
 
-check_enable:
-	for_each_possible_cpu(i) {
-		if (per_cpu(sync_info, i).input_boost_freq) {
-			enabled = true;
-			break;
-		}
-	}
-	input_boost_enabled = enabled;
-
+out:
 	return 0;
 }
 
@@ -99,6 +105,9 @@ static int get_input_boost_freq(char *buf, const struct kernel_param *kp)
 {
 	int cnt = 0, cpu;
 	struct cpu_sync *s;
+
+	if (task_is_booster(current))
+		return cnt;
 
 	for_each_possible_cpu(cpu) {
 		s = &per_cpu(sync_info, cpu);
@@ -187,16 +196,37 @@ static void do_input_boost_rem(struct work_struct *work)
 	}
 }
 
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+static void do_dynamic_stune_boost_rem(struct work_struct *work)
+{
+	/* Reset dynamic stune boost value to the default value */
+	if (stune_boost_active) {
+		reset_stune_boost("top-app", boost_slot);
+		stune_boost_active = false;
+	}
+}
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
+
 static void do_input_boost(struct work_struct *work)
 {
 	unsigned int i, ret;
 	struct cpu_sync *i_sync_info;
 
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	cancel_delayed_work_sync(&dynamic_stune_boost_rem);
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 	cancel_delayed_work_sync(&input_boost_rem);
 	if (sched_boost_active) {
 		sched_set_boost(0);
 		sched_boost_active = false;
 	}
+
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	if (stune_boost_active) {
+		reset_stune_boost("top-app", boost_slot);
+		stune_boost_active = false;
+	}
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	/* Set the input_boost_min for all CPUs in the system */
 	pr_debug("Setting input boost min for all CPUs\n");
@@ -216,6 +246,16 @@ static void do_input_boost(struct work_struct *work)
 		else
 			sched_boost_active = true;
 	}
+
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	/* Set dynamic stune boost value */
+	ret = do_stune_boost("top-app", dynamic_stune_boost, &boost_slot);
+	if (!ret)
+		stune_boost_active = true;
+
+	queue_delayed_work(cpu_boost_wq, &dynamic_stune_boost_rem,
+					msecs_to_jiffies(dynamic_stune_boost_ms));
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	queue_delayed_work(cpu_boost_wq, &input_boost_rem,
 					msecs_to_jiffies(input_boost_ms));
@@ -272,6 +312,11 @@ err2:
 
 static void cpuboost_input_disconnect(struct input_handle *handle)
 {
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	/* Reset dynamic stune boost value to the default value */
+	reset_stune_boost("top-app", boost_slot);
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
+
 	input_close_device(handle);
 	input_unregister_handle(handle);
 	kfree(handle);
@@ -322,10 +367,18 @@ static int cpu_boost_init(void)
 
 	INIT_WORK(&input_boost_work, do_input_boost);
 	INIT_DELAYED_WORK(&input_boost_rem, do_input_boost_rem);
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	INIT_DELAYED_WORK(&dynamic_stune_boost_rem, do_dynamic_stune_boost_rem);
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	for_each_possible_cpu(cpu) {
 		s = &per_cpu(sync_info, cpu);
 		s->cpu = cpu;
+
+		if (cpu == 0)
+			s->input_boost_freq = CONFIG_INPUT_BOOST_FREQ_LP;
+		if (cpu == 4)
+			s->input_boost_freq = CONFIG_INPUT_BOOST_FREQ_PERF;
 	}
 	cpufreq_register_notifier(&boost_adjust_nb, CPUFREQ_POLICY_NOTIFIER);
 

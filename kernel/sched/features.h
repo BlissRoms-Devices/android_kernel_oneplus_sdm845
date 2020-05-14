@@ -55,7 +55,7 @@ SCHED_FEAT(NONTASK_CAPACITY, true)
  * Queue remote wakeups on the target CPU and process them
  * using the scheduler IPI. Reduces rq->lock contention/bounces.
  */
-SCHED_FEAT(TTWU_QUEUE, false)
+SCHED_FEAT(TTWU_QUEUE, true)
 
 /*
  * When doing wakeups, attempt to limit superfluous scans of the LLC domain.
@@ -91,14 +91,6 @@ SCHED_FEAT(ENERGY_AWARE, false)
 #endif
 
 /*
- * Minimum capacity capping. Keep track of minimum capacity factor when
- * minimum frequency available to a policy is modified.
- * If enabled, this can be used to inform the scheduler about capacity
- * restrictions.
- */
-SCHED_FEAT(MIN_CAPACITY_CAPPING, false)
-
-/*
  * Enforce the priority of candidates selected by find_best_target()
  * ON: If the target CPU saves any energy, use that.
  * OFF: Use whichever of target or backup saves most.
@@ -109,4 +101,4 @@ SCHED_FEAT(FBT_STRICT_ORDER, false)
  * ON: schedtune.prefer_idle is replaced with need_idle
  * OFF: schedtune.prefer_idle is honored as is.
  */
-SCHED_FEAT(EAS_USE_NEED_IDLE, true)
+SCHED_FEAT(EAS_USE_NEED_IDLE, false)

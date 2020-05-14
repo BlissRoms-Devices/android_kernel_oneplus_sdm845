@@ -143,7 +143,13 @@ static inline void update_idle_core(struct rq *rq) { }
 #ifdef CONFIG_64BIT
 # define NICE_0_LOAD_SHIFT	(SCHED_FIXEDPOINT_SHIFT + SCHED_FIXEDPOINT_SHIFT)
 # define scale_load(w)		((w) << SCHED_FIXEDPOINT_SHIFT)
-# define scale_load_down(w)	((w) >> SCHED_FIXEDPOINT_SHIFT)
+# define scale_load_down(w) \
+({ \
+	unsigned long __w = (w); \
+	if (__w) \
+		__w = max(2UL, __w >> SCHED_FIXEDPOINT_SHIFT); \
+	__w; \
+})
 #else
 # define NICE_0_LOAD_SHIFT	(SCHED_FIXEDPOINT_SHIFT)
 # define scale_load(w)		(w)
@@ -2369,11 +2375,6 @@ static inline void cpufreq_update_util(struct rq *rq, unsigned int flags)
 {
 	struct update_util_data *data;
 
-#ifdef CONFIG_SCHED_WALT
-	if (!(flags & SCHED_CPUFREQ_WALT))
-		return;
-#endif
-
 	data = rcu_dereference_sched(*per_cpu_ptr(&cpufreq_update_util_data,
 					cpu_of(rq)));
 	if (data)
@@ -2801,7 +2802,7 @@ static inline enum sched_boost_policy task_boost_policy(struct task_struct *p)
 		 */
 		if (sysctl_sched_boost == CONSERVATIVE_BOOST &&
 				task_util(p) <=
-				sysctl_sched_min_task_util_for_boost_colocation)
+				sysctl_sched_min_task_util_for_boost)
 			boost_on_big = SCHED_BOOST_NONE;
 	}
 

@@ -1,3 +1,4 @@
+#include <linux/binfmts.h>
 #include <linux/cgroup.h>
 #include <linux/err.h>
 #include <linux/percpu.h>
@@ -7,6 +8,7 @@
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <trace/events/sched.h>
+#include <linux/list.h>
 
 #include "sched.h"
 #include "tune.h"
@@ -21,6 +23,18 @@ unsigned int sysctl_sched_cfs_boost __read_mostly;
 
 extern struct reciprocal_value schedtune_spc_rdiv;
 struct target_nrg schedtune_target_nrg;
+
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+#define DYNAMIC_BOOST_SLOTS_COUNT 5
+static DEFINE_MUTEX(boost_slot_mutex);
+static DEFINE_MUTEX(stune_boost_mutex);
+static struct schedtune *getSchedtune(char *st_name);
+static int dynamic_boost(struct schedtune *st, int boost);
+struct boost_slot {
+	struct list_head list;
+	int idx;
+};
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 /* Performance Boost region (B) threshold params */
 static int perf_boost_idx;
@@ -217,6 +231,27 @@ struct schedtune {
 	/* Hint to bias scheduling of tasks on that SchedTune CGroup
 	 * towards idle CPUs */
 	int prefer_idle;
+
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	/*
+	 * This tracks the default boost value and is used to restore
+	 * the value when Dynamic SchedTune Boost is reset.
+	 */
+	int boost_default;
+
+	/* Sched Boost value for tasks on that SchedTune CGroup */
+	int sched_boost;
+
+	/* Number of ongoing boosts for this SchedTune CGroup */
+	int boost_count;
+
+	/* Lists of active and available boost slots */
+	struct boost_slot active_boost_slots;
+	struct boost_slot available_boost_slots;
+
+	/* Array of tracked boost values of each slot */
+	int slot_boost[DYNAMIC_BOOST_SLOTS_COUNT];
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 };
 
 static inline struct schedtune *css_st(struct cgroup_subsys_state *css)
@@ -256,6 +291,20 @@ root_schedtune = {
 	.perf_boost_idx = 0,
 	.perf_constrain_idx = 0,
 	.prefer_idle = 0,
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	.boost_default = 0,
+	.sched_boost = 0,
+	.boost_count = 0,
+	.active_boost_slots = {
+		.list = LIST_HEAD_INIT(root_schedtune.active_boost_slots.list),
+		.idx = 0,
+	},
+	.available_boost_slots = {
+		.list = LIST_HEAD_INIT(root_schedtune.available_boost_slots.list),
+		.idx = 0,
+	},
+	.slot_boost = {0},
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 };
 
 int
@@ -761,6 +810,24 @@ int schedtune_task_boost(struct task_struct *p)
 	return task_boost;
 }
 
+/*  The same as schedtune_task_boost except assuming the caller has the rcu read
+ *  lock.
+ */
+int schedtune_task_boost_rcu_locked(struct task_struct *p)
+{
+	struct schedtune *st;
+	int task_boost;
+
+	if (unlikely(!schedtune_initialized))
+		return 0;
+
+	/* Get task boost value */
+	st = task_schedtune(p);
+	task_boost = st->boost;
+
+	return task_boost;
+}
+
 int schedtune_prefer_idle(struct task_struct *p)
 {
 	struct schedtune *st;
@@ -850,6 +917,9 @@ boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
 	st->perf_constrain_idx = threshold_idx;
 
 	st->boost = boost;
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	st->boost_default = boost;
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 	if (css == &root_schedtune.css) {
 		sysctl_sched_cfs_boost = boost;
 		perf_boost_idx  = threshold_idx;
@@ -864,12 +934,109 @@ boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
 	return 0;
 }
 
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+static s64
+sched_boost_read(struct cgroup_subsys_state *css, struct cftype *cft)
+{
+	struct schedtune *st = css_st(css);
+
+	return st->sched_boost;
+}
+
+static int
+sched_boost_write(struct cgroup_subsys_state *css, struct cftype *cft,
+	    s64 sched_boost)
+{
+	struct schedtune *st = css_st(css);
+	st->sched_boost = sched_boost;
+
+	return 0;
+}
+
+static void
+boost_slots_init(struct schedtune *st)
+{
+	int i;
+	struct boost_slot *slot;
+
+	/* Initialize boost slots */
+	INIT_LIST_HEAD(&(st->active_boost_slots.list));
+	INIT_LIST_HEAD(&(st->available_boost_slots.list));
+
+	/* Populate available_boost_slots */
+	for (i = 0; i < DYNAMIC_BOOST_SLOTS_COUNT; ++i) {
+		slot = kmalloc(sizeof(*slot), GFP_KERNEL);
+		slot->idx = i;
+		list_add_tail(&(slot->list), &(st->available_boost_slots.list));
+	}
+}
+
+static void
+boost_slots_release(struct schedtune *st)
+{
+	struct boost_slot *slot, *next_slot;
+
+	list_for_each_entry_safe(slot, next_slot,
+				 &(st->available_boost_slots.list), list) {
+		list_del(&slot->list);
+		pr_info("STUNE: freed!\n");
+		kfree(slot);
+	}
+	list_for_each_entry_safe(slot, next_slot,
+				 &(st->active_boost_slots.list), list) {
+		list_del(&slot->list);
+		pr_info("STUNE: freed!\n");
+		kfree(slot);
+	}
+}
+#endif // CONFIG_DYNAMIC_STUNE_BOOST
+
+#ifdef CONFIG_STUNE_ASSIST
+#ifdef CONFIG_SCHED_WALT
+static int sched_boost_override_write_wrapper(struct cgroup_subsys_state *css,
+					      struct cftype *cft, u64 override)
+{
+	if (task_is_booster(current))
+		return 0;
+
+	return sched_boost_override_write(css, cft, override);
+}
+
+static int sched_colocate_write_wrapper(struct cgroup_subsys_state *css,
+					struct cftype *cft, u64 colocate)
+{
+	if (task_is_booster(current))
+		return 0;
+
+	return sched_colocate_write(css, cft, colocate);
+}
+#endif
+
+static int boost_write_wrapper(struct cgroup_subsys_state *css,
+			       struct cftype *cft, s64 boost)
+{
+	if (task_is_booster(current))
+		return 0;
+
+	return boost_write(css, cft, boost);
+}
+
+static int prefer_idle_write_wrapper(struct cgroup_subsys_state *css,
+				     struct cftype *cft, u64 prefer_idle)
+{
+	if (task_is_booster(current))
+		return 0;
+
+	return prefer_idle_write(css, cft, prefer_idle);
+}
+#endif
+
 static struct cftype files[] = {
 #ifdef CONFIG_SCHED_WALT
 	{
 		.name = "sched_boost_no_override",
 		.read_u64 = sched_boost_override_read,
-		.write_u64 = sched_boost_override_write,
+		.write_u64 = sched_boost_override_write_wrapper,
 	},
 	{
 		.name = "sched_boost_enabled",
@@ -879,19 +1046,26 @@ static struct cftype files[] = {
 	{
 		.name = "colocate",
 		.read_u64 = sched_colocate_read,
-		.write_u64 = sched_colocate_write,
+		.write_u64 = sched_colocate_write_wrapper,
 	},
 #endif
 	{
 		.name = "boost",
 		.read_s64 = boost_read,
-		.write_s64 = boost_write,
+		.write_s64 = boost_write_wrapper,
 	},
 	{
 		.name = "prefer_idle",
 		.read_u64 = prefer_idle_read,
-		.write_u64 = prefer_idle_write,
+		.write_u64 = prefer_idle_write_wrapper,
 	},
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	{
+		.name = "sched_boost",
+		.read_s64 = sched_boost_read,
+		.write_s64 = sched_boost_write,
+	},
+#endif // CONFIG_DYNAMIC_STUNE_BOOST
 	{ }	/* terminate */
 };
 
@@ -908,10 +1082,53 @@ schedtune_boostgroup_init(struct schedtune *st, int idx)
 		bg->group[idx].valid = true;
 	}
 
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	boost_slots_init(st);
+#endif // CONFIG_DYNAMIC_STUNE_BOOST
+
 	/* Keep track of allocated boost groups */
 	allocated_group[idx] = st;
 	st->idx = idx;
 }
+
+#ifdef CONFIG_STUNE_ASSIST
+struct st_data {
+	char *name;
+	int boost;
+	bool prefer_idle;
+	bool colocate;
+	bool no_override;
+};
+
+static void write_default_values(struct cgroup_subsys_state *css)
+{
+	static struct st_data st_targets[] = {
+		{ "audio-app",	0, 0, 0, 0 },
+		{ "background",	0, 0, 0, 0 },
+		{ "foreground",	0, 1, 0, 0 },
+		{ "rt",		0, 0, 0, 0 },
+		{ "top-app",   10, 1, 0, 0 },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(st_targets); i++) {
+		struct st_data tgt = st_targets[i];
+
+		if (!strcmp(css->cgroup->kn->name, tgt.name)) {
+			pr_info("stune_assist: setting values for %s: boost=%d prefer_idle=%d colocate=%d no_override=%d\n",
+				tgt.name, tgt.boost, tgt.prefer_idle,
+				tgt.colocate, tgt.no_override);
+
+			boost_write(css, NULL, tgt.boost);
+			prefer_idle_write(css, NULL, tgt.prefer_idle);
+#ifdef CONFIG_SCHED_WALT
+			sched_colocate_write(css, NULL, tgt.colocate);
+			sched_boost_override_write(css, NULL, tgt.no_override);
+#endif
+		}
+	}
+}
+#endif
 
 static struct cgroup_subsys_state *
 schedtune_css_alloc(struct cgroup_subsys_state *parent_css)
@@ -928,10 +1145,13 @@ schedtune_css_alloc(struct cgroup_subsys_state *parent_css)
 		return ERR_PTR(-ENOMEM);
 	}
 
-	/* Allow only a limited number of boosting groups */
-	for (idx = 1; idx < BOOSTGROUPS_COUNT; ++idx)
+		for (idx = 1; idx < BOOSTGROUPS_COUNT; ++idx) {
 		if (!allocated_group[idx])
 			break;
+#ifdef CONFIG_STUNE_ASSIST
+		write_default_values(&allocated_group[idx]->css);
+#endif
+	}
 	if (idx == BOOSTGROUPS_COUNT) {
 		pr_err("Trying to create more than %d SchedTune boosting groups\n",
 		       BOOSTGROUPS_COUNT);
@@ -957,6 +1177,11 @@ schedtune_boostgroup_release(struct schedtune *st)
 {
 	struct boost_groups *bg;
 	int cpu;
+
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	/* Free dynamic boost slots */
+	boost_slots_release(st);
+#endif // CONFIG_DYNAMIC_STUNE_BOOST
 
 	/* Reset per CPUs boost group support */
 	for_each_possible_cpu(cpu) {
@@ -1009,6 +1234,224 @@ schedtune_init_cgroups(void)
 
 	schedtune_initialized = true;
 }
+
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+static struct schedtune *getSchedtune(char *st_name)
+{
+	int idx;
+
+	for (idx = 1; idx < BOOSTGROUPS_COUNT; ++idx) {
+		char name_buf[NAME_MAX + 1];
+		struct schedtune *st = allocated_group[idx];
+
+		if (!st) {
+			pr_warn("SCHEDTUNE: Could not find %s\n", st_name);
+			break;
+		}
+
+		cgroup_name(st->css.cgroup, name_buf, sizeof(name_buf));
+		if (strncmp(name_buf, st_name, strlen(st_name)) == 0)
+			return st;
+	}
+
+	return NULL;
+}
+
+static int dynamic_boost(struct schedtune *st, int boost)
+{
+	int ret;
+	/* Backup boost_default */
+	int boost_default_backup = st->boost_default;
+
+	ret = boost_write(&st->css, NULL, boost);
+
+	/* Restore boost_default */
+	st->boost_default = boost_default_backup;
+
+	return ret;
+}
+
+static inline bool is_valid_boost_slot(int slot)
+{
+	return slot >= 0 && slot < DYNAMIC_BOOST_SLOTS_COUNT;
+}
+
+static int activate_boost_slot(struct schedtune *st, int boost, int *slot)
+{
+	int ret = 0;
+	struct boost_slot *curr_slot;
+	struct list_head *head;
+	*slot = -1;
+
+	mutex_lock(&boost_slot_mutex);
+
+	/* Check for slots in available_boost_slots */
+	if (list_empty(&(st->available_boost_slots.list))) {
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	/*
+	 * Move one slot from available_boost_slots to active_boost_slots
+	 */
+
+	/* Get first slot from available_boost_slots */
+	head = &(st->available_boost_slots.list);
+	curr_slot = list_first_entry(head, struct boost_slot, list);
+
+	/* Store slot value and boost value*/
+	*slot = curr_slot->idx;
+	st->slot_boost[*slot] = boost;
+
+	/* Delete slot from available_boost_slots */
+	list_del(&curr_slot->list);
+	kfree(curr_slot);
+
+	/* Create new slot with same value at tail of active_boost_slots */
+	curr_slot = kmalloc(sizeof(*curr_slot), GFP_KERNEL);
+	curr_slot->idx = *slot;
+	list_add_tail(&(curr_slot->list),
+		&(st->active_boost_slots.list));
+
+exit:
+	mutex_unlock(&boost_slot_mutex);
+	return ret;
+}
+
+static int deactivate_boost_slot(struct schedtune *st, int slot)
+{
+	int ret = 0;
+	struct boost_slot *curr_slot, *next_slot;
+
+	mutex_lock(&boost_slot_mutex);
+
+	if (!is_valid_boost_slot(slot)) {
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	/* Delete slot from active_boost_slots */
+	list_for_each_entry_safe(curr_slot, next_slot,
+				 &(st->active_boost_slots.list), list) {
+		if (curr_slot->idx == slot) {
+			st->slot_boost[slot] = 0;
+			list_del(&curr_slot->list);
+			kfree(curr_slot);
+
+			/* Create same slot at tail of available_boost_slots */
+			curr_slot = kmalloc(sizeof(*curr_slot), GFP_KERNEL);
+			curr_slot->idx = slot;
+			list_add_tail(&(curr_slot->list),
+				      &(st->available_boost_slots.list));
+
+			goto exit;
+		}
+	}
+
+	/* Reaching here means that we did not find the slot to delete */
+	ret = -EINVAL;
+
+exit:
+	mutex_unlock(&boost_slot_mutex);
+	return ret;
+}
+
+static int max_active_boost(struct schedtune *st)
+{
+	struct boost_slot *slot;
+	int max_boost;
+
+	mutex_lock(&boost_slot_mutex);
+	mutex_lock(&stune_boost_mutex);
+
+	/* Set initial value to default boost */
+	max_boost = st->boost_default;
+
+	/* Check for active boosts */
+	if (list_empty(&(st->active_boost_slots.list))) {
+		goto exit;
+	}
+
+	/* Get largest boost value */
+	list_for_each_entry(slot, &(st->active_boost_slots.list), list) {
+		int boost = st->slot_boost[slot->idx];
+		if (boost > max_boost)
+			max_boost = boost;
+	}
+
+exit:
+	mutex_unlock(&stune_boost_mutex);
+	mutex_unlock(&boost_slot_mutex);
+
+	return max_boost;
+}
+
+static int _do_stune_boost(struct schedtune *st, int boost, int *slot)
+{
+	int ret = 0;
+
+	/* Try to obtain boost slot */
+	ret = activate_boost_slot(st, boost, slot);
+
+	/* Check if boost slot obtained successfully */
+	if (ret)
+		return -EINVAL;
+
+	/* Boost if new value is greater than current */
+	mutex_lock(&stune_boost_mutex);
+	if (boost > st->boost)
+		ret = dynamic_boost(st, boost);
+	mutex_unlock(&stune_boost_mutex);
+
+	return ret;
+}
+
+int reset_stune_boost(char *st_name, int slot)
+{
+	int ret = 0;
+	int boost = 0;
+	struct schedtune *st = getSchedtune(st_name);
+
+	if (!st)
+		return -EINVAL;
+
+	ret = deactivate_boost_slot(st, slot);
+	if (ret) {
+		return -EINVAL;
+	}
+	/* Find next largest active boost or reset to default */
+	boost = max_active_boost(st);
+
+	mutex_lock(&stune_boost_mutex);
+	/* Boost only if value changed */
+	if (boost != st->boost)
+		ret = dynamic_boost(st, boost);
+	mutex_unlock(&stune_boost_mutex);
+
+	return ret;
+}
+
+int do_stune_sched_boost(char *st_name, int *slot)
+{
+	struct schedtune *st = getSchedtune(st_name);
+
+	if (!st)
+		return -EINVAL;
+
+	return _do_stune_boost(st, st->sched_boost, slot);
+}
+
+int do_stune_boost(char *st_name, int boost, int *slot)
+{
+	struct schedtune *st = getSchedtune(st_name);
+
+	if (!st)
+		return -EINVAL;
+
+	return _do_stune_boost(st, boost, slot);
+}
+
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 #else /* CONFIG_CGROUP_SCHEDTUNE */
 
